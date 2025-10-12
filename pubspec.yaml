@@ -28,6 +28,7 @@ dependencies:
   http: ^1.1.0 # Added http package for ApiService
   latlong2: ^0.9.1
   flutter_map: ^8.2.2
+  googleapis_auth: ^2.0.0
 
 dev_dependencies:
   flutter_test:
@@ -41,3 +42,4 @@ flutter:
   # We only need to declare the assets folder for our icons now
   assets:
     - assets/
+    - credentials/

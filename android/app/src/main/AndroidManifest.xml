@@ -3,6 +3,11 @@
         android:label="samp"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+
+        <service
+        android:name="com.dexterous.flutterlocalnotifications.ForegroundService"
+        android:exported="false"
+        android:stopWithTask="false"/>
         <activity
             android:name=".MainActivity"
             android:exported="true"

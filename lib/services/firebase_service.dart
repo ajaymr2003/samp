@@ -1,12 +1,41 @@
+import 'dart:convert';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_database/firebase_database.dart';
+import 'package:http/http.dart' as http;
+import 'package:googleapis_auth/auth_io.dart';
 import '../models/navigation_request_model.dart';
 import '../models/station_model.dart';
+import '../models/user_model.dart';
 import '../models/vehicle_model.dart';
 
 class FirebaseService {
   final FirebaseDatabase _database = FirebaseDatabase.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+
+  // --- V1 API CONFIGURATION ---
+  // IMPORTANT: Replace with the actual name of your JSON file.
+  final String _serviceAccountJsonPath = 'credentials/serviceAccountKey.json';
+  // IMPORTANT: Replace with your actual Project ID from Firebase Settings.
+  final String _projectId = 'miniproject-c03ff';
+
+  // --- Method to get an OAuth 2.0 Access Token ---
+  Future<String?> _getAccessToken() async {
+    try {
+      final jsonString = await rootBundle.loadString(_serviceAccountJsonPath);
+      final credentials = ServiceAccountCredentials.fromJson(jsonString);
+      final scopes = ['https://www.googleapis.com/auth/firebase.messaging'];
+
+      final client = await clientViaServiceAccount(credentials, scopes);
+      return client.credentials.accessToken.data;
+    } catch (e) {
+      print("Error getting FCM access token: $e");
+      print("IMPORTANT: Make sure '$_serviceAccountJsonPath' exists and is added to pubspec.yaml assets.");
+      return null;
+    }
+  }
+
+  // --- GENERAL METHODS ---
 
   String _encodeEmail(String email) {
     return email.replaceAll('.', ',');
@@ -23,6 +52,7 @@ class FirebaseService {
     }
   }
   
+  // --- VEHICLE METHODS ---
   Stream<Vehicle> getVehicleStream({required String email}) {
     final encodedEmail = _encodeEmail(email);
     final vehicleRef = _database.ref('vehicles/$encodedEmail');
@@ -48,7 +78,6 @@ class FirebaseService {
   }
 
   // --- STATION DATA METHODS ---
-
   Future<List<Station>> getStations() async {
     try {
       final snapshot = await _firestore.collection('stations').orderBy('name').get();
@@ -87,7 +116,6 @@ class FirebaseService {
   }
 
   // --- NAVIGATION METHODS ---
-
   Stream<NavigationRequest?> getNavigationStream({required String email}) {
     return _firestore.collection('navigation').doc(email).snapshots().map((doc) {
       if (doc.exists) {
@@ -103,6 +131,65 @@ class FirebaseService {
       await navRef.update({'isNavigating': false, 'vehicleReachedStation': false});
     } catch (e) {
       print("Could not end navigation (might not exist): $e");
+    }
+  }
+
+  // --- USER SETTINGS & NOTIFICATION METHODS ---
+  Future<UserModel?> getUserSettings(String email) async {
+    try {
+      final doc = await _firestore.collection('users').doc(email).get();
+      if (doc.exists && doc.data() != null) {
+        return UserModel.fromFirestore(doc.data()!);
+      }
+    } catch (e) {
+      print("Error fetching user settings: $e");
+    }
+    return null;
+  }
+
+  Future<void> sendLowBatteryNotification({
+    required String fcmToken,
+    required double batteryLevel,
+  }) async {
+    if (fcmToken.isEmpty) {
+      print("FCM token is empty. Cannot send notification.");
+      return;
+    }
+
+    final accessToken = await _getAccessToken();
+    if (accessToken == null) {
+      print("Failed to get access token. Cannot send notification.");
+      return;
+    }
+
+    final String url = 'https://fcm.googleapis.com/v1/projects/$_projectId/messages:send';
+
+    final Map<String, dynamic> message = {
+      'message': {
+        'token': fcmToken,
+        'notification': {
+          'title': 'Low Battery Alert!',
+          'body': 'Your EV battery is at ${batteryLevel.toStringAsFixed(0)}%. Find a charging station soon.',
+        },
+      }
+    };
+
+    try {
+      final response = await http.post(
+        Uri.parse(url),
+        headers: <String, String>{
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $accessToken',
+        },
+        body: jsonEncode(message),
+      );
+      if (response.statusCode == 200) {
+        print("Successfully sent low battery notification via V1 API.");
+      } else {
+        print("Failed to send V1 notification: ${response.statusCode} - ${response.body}");
+      }
+    } catch (e) {
+      print("Error sending V1 FCM notification: $e");
     }
   }
 }

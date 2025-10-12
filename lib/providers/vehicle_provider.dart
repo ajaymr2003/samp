@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:latlong2/latlong.dart' as latlong;
+import '../models/user_model.dart';
 import '../models/vehicle_model.dart';
 import '../services/firebase_service.dart';
 
@@ -13,13 +14,19 @@ class VehicleProvider with ChangeNotifier {
   bool get isSimulating => _vehicle.isRunning;
   bool get isPaused => _vehicle.isPaused;
 
+  // --- Simulation State ---
   Timer? _simulationTimer;
   List<latlong.LatLng> _route = [];
   DateTime? _startTime;
   DateTime? _pauseTime;
   DateTime? _lastTickTime;
   double _lastKnownBattery = 100.0;
+  
+  // --- State for notification logic ---
+  UserModel? _userSettings;
+  bool _notificationSent = false;
 
+  // --- Dynamic Simulation Parameters ---
   double _vehicleSpeedKmh = 60.0;
   double _drainRatePerMinute = 1.0;
   
@@ -30,8 +37,12 @@ class VehicleProvider with ChangeNotifier {
 
   void initialize(String userEmail) {
     if (_currentUserEmail == userEmail && _vehicleSubscription != null) return;
+    
     _currentUserEmail = userEmail;
     _vehicleSubscription?.cancel();
+    
+    _loadUserSettings(userEmail);
+    
     _vehicleSubscription = _firebaseService.getVehicleStream(email: userEmail).listen((vehicleData) {
       _vehicle = vehicleData;
       _lastKnownBattery = vehicleData.batteryLevel;
@@ -42,6 +53,11 @@ class VehicleProvider with ChangeNotifier {
     });
   }
 
+  Future<void> _loadUserSettings(String email) async {
+    _userSettings = await _firebaseService.getUserSettings(email);
+    _notificationSent = false; // Reset notification flag for new user/session
+  }
+
   void updateVehicleSpeed(double speedKmh) { _vehicleSpeedKmh = speedKmh; }
   void updateDrainRate(double ratePerMinute) { _drainRatePerMinute = ratePerMinute; }
   Future<void> manuallyUpdatePosition(String userEmail, latlong.LatLng newPosition) async {
@@ -50,11 +66,8 @@ class VehicleProvider with ChangeNotifier {
     await _firebaseService.updateVehicleState(email: userEmail, vehicle: updatedVehicle);
   }
 
-  // --- NEW: Method to manually set the vehicle's battery level ---
   Future<void> manuallyUpdateBattery(String userEmail, double newBatteryLevel) async {
-    if (isSimulating || isPaused) return; // Prevent changing battery mid-trip
-
-    // Clamp the value to be between 0 and 100
+    if (isSimulating || isPaused) return;
     final clampedLevel = newBatteryLevel.clamp(0.0, 100.0);
     final updatedVehicle = _vehicle.copyWith(batteryLevel: clampedLevel);
     await _firebaseService.updateVehicleState(email: userEmail, vehicle: updatedVehicle);
@@ -68,12 +81,16 @@ class VehicleProvider with ChangeNotifier {
     required double initialDrainRate,
   }) {
     if (isSimulating || route.isEmpty) return;
+
+    _notificationSent = false; // Reset notification flag on new trip
+
     _vehicleSpeedKmh = initialSpeedKmh;
     _drainRatePerMinute = initialDrainRate;
     _route = route;
     _startTime = DateTime.now();
     _lastTickTime = DateTime.now();
     _lastKnownBattery = initialBattery;
+    
     final startingVehicleState = _vehicle.copyWith(
       latitude: route.first.latitude, longitude: route.first.longitude,
       isRunning: true, isPaused: false, batteryLevel: initialBattery,
@@ -129,7 +146,10 @@ class VehicleProvider with ChangeNotifier {
     final lastTick = _lastTickTime;
     final startTime = _startTime;
     if (startTime == null || lastTick == null || _route.length < 2) { return; }
+    
     final now = DateTime.now();
+
+    // Position Calculation
     final elapsedTotal = now.difference(startTime);
     final speedMetersPerSecond = _vehicleSpeedKmh * 1000 / 3600;
     final targetDistanceMeters = elapsedTotal.inMilliseconds * speedMetersPerSecond / 1000;
@@ -147,17 +167,38 @@ class VehicleProvider with ChangeNotifier {
       }
       distanceTraveled += segmentLength;
     }
+    
     if (currentPosition == null) {
       currentPosition = _route.last;
       stopAndEndTrip(userEmail);
     }
+    
+    // Incremental Battery Calculation
     final deltaTime = now.difference(lastTick);
     final drainRatePerSecond = _drainRatePerMinute / 60.0;
     final drainedAmount = deltaTime.inMilliseconds / 1000.0 * drainRatePerSecond;
     _lastKnownBattery -= drainedAmount;
     if (_lastKnownBattery < 0) _lastKnownBattery = 0;
     _lastTickTime = now;
-    final updatedVehicle = _vehicle.copyWith(latitude: currentPosition.latitude, longitude: currentPosition.longitude, batteryLevel: _lastKnownBattery);
+    
+    // Notification Check
+    if (_userSettings != null && !_notificationSent) {
+      if (_lastKnownBattery <= _userSettings!.threshold) {
+        print("Threshold reached! Sending notification...");
+        _notificationSent = true;
+        _firebaseService.sendLowBatteryNotification(
+          fcmToken: _userSettings!.fcmToken,
+          batteryLevel: _lastKnownBattery,
+        );
+      }
+    }
+    
+    // Update Firebase
+    final updatedVehicle = _vehicle.copyWith(
+      latitude: currentPosition.latitude,
+      longitude: currentPosition.longitude,
+      batteryLevel: _lastKnownBattery,
+    );
     _firebaseService.updateVehicleState(email: userEmail, vehicle: updatedVehicle);
   }
   
