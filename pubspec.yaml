@@ -1,0 +1,43 @@
+name: samp
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Firebase Core is required for all Firebase services
+  firebase_core: ^4.1.1
+
+  # Updated Firebase Services
+  firebase_auth: ^6.1.0
+  firebase_database: ^12.0.2
+  cloud_firestore: ^6.0.2
+  
+  # UI and State Management
+  google_maps_flutter: ^2.5.3
+  provider: ^6.1.1
+  cupertino_icons: ^1.0.6
+
+  # For making API calls to your backend
+  http: ^1.1.0 # Added http package for ApiService
+  latlong2: ^0.9.1
+  flutter_map: ^8.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  # We only need to declare the assets folder for our icons now
+  assets:
+    - assets/
