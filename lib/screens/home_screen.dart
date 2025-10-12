@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:provider/provider.dart';
+import '../models/navigation_request_model.dart';
 import '../models/station_model.dart';
 import '../models/vehicle_model.dart';
 import '../providers/station_provider.dart';
@@ -38,6 +39,10 @@ class _HomeScreenState extends State<HomeScreen> {
   // Simulation parameters
   double _vehicleSpeedKmh = 60.0;
   double _drainRatePerMinute = 1.0;
+  
+  // State for handling remote navigation
+  StreamSubscription? _navigationSubscription;
+  bool _isProcessingRemoteNav = false; // State lock for remote commands
 
   @override
   void initState() {
@@ -60,6 +65,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _navigationSubscription?.cancel();
     _batteryController.dispose();
     super.dispose();
   }
@@ -68,14 +74,17 @@ class _HomeScreenState extends State<HomeScreen> {
     if (email == null || email == _selectedUserEmail) return;
     final vehicleProvider = Provider.of<VehicleProvider>(context, listen: false);
     if (vehicleProvider.isSimulating || vehicleProvider.isPaused) {
-       vehicleProvider.stopSimulation(_selectedUserEmail!);
+       vehicleProvider.stopAndEndTrip(_selectedUserEmail!);
     }
     _resetState(clearUser: false);
     setState(() { _selectedUserEmail = email; });
     vehicleProvider.initialize(email);
+    
+    _listenForRemoteNavigation(email);
+
     final vehicleStream = _firebaseService.getVehicleStream(email: email);
-    StreamSubscription? subscription;
-    subscription = vehicleStream.listen((vehicle) {
+    StreamSubscription? tempSub;
+    tempSub = vehicleStream.listen((vehicle) {
       if (mounted) {
         final vehicleLocation = LatLng(vehicle.latitude, vehicle.longitude);
         _mapController.move(vehicleLocation, 14.0);
@@ -84,25 +93,80 @@ class _HomeScreenState extends State<HomeScreen> {
           _mapInstruction = "Vehicle location set. Click map to set a Destination.";
         });
       }
-      subscription?.cancel();
+      tempSub?.cancel();
     });
+  }
+
+  void _listenForRemoteNavigation(String email) {
+    _navigationSubscription?.cancel();
+    _navigationSubscription = _firebaseService.getNavigationStream(email: email).listen((navRequest) {
+      if (navRequest != null && navRequest.isNavigating && !_isProcessingRemoteNav) {
+        _startRemoteNavigation(navRequest);
+      } 
+      else if (navRequest == null || !navRequest.isNavigating) {
+         if (_isProcessingRemoteNav) {
+          setState(() {
+            _isProcessingRemoteNav = false;
+            _destinationPoint = null;
+            _routePoints = [];
+            _mapInstruction = "Remote trip ended. Set a new destination.";
+          });
+        }
+      }
+    });
+  }
+
+  Future<void> _startRemoteNavigation(NavigationRequest navRequest) async {
+    final vehicleProvider = Provider.of<VehicleProvider>(context, listen: false);
+
+    setState(() {
+      _isProcessingRemoteNav = true;
+      if (vehicleProvider.isSimulating || vehicleProvider.isPaused) {
+        vehicleProvider.forceStopForOverride(_selectedUserEmail!);
+      }
+      _mapInstruction = "REMOTE COMMAND: Calculating route...";
+      _destinationPoint = navRequest.end;
+      _routePoints = [];
+    });
+
+    final newRoute = await _calculateAndDrawRoute(navRequest.start);
+    if (newRoute != null) {
+      vehicleProvider.startSimulation(
+        route: newRoute,
+        userEmail: _selectedUserEmail!,
+        initialBattery: vehicleProvider.vehicle.batteryLevel,
+        initialSpeedKmh: _vehicleSpeedKmh,
+        initialDrainRate: _drainRatePerMinute,
+      );
+      setState(() { _mapInstruction = "AUTOMATIC TRIP IN PROGRESS..."; });
+    } else {
+      await _firebaseService.endNavigation(email: _selectedUserEmail!);
+      setState(() { 
+        _mapInstruction = "Failed to calculate remote route.";
+        _isProcessingRemoteNav = false;
+      });
+    }
   }
 
   void _resetState({bool clearUser = false}) {
     setState(() {
-      if (clearUser) _selectedUserEmail = null;
+      if (clearUser) {
+        _selectedUserEmail = null;
+        _navigationSubscription?.cancel();
+      }
       _destinationPoint = null;
       _routePoints = [];
       _vehicleSpeedKmh = 60.0;
       _drainRatePerMinute = 1.0;
       _isEditingLocation = false;
+      _isProcessingRemoteNav = false;
       _mapInstruction = "Select a user to begin.";
     });
   }
 
   Future<void> _onMapTap(TapPosition pos, LatLng latlng) async {
     final vehicleProvider = Provider.of<VehicleProvider>(context, listen: false);
-    if (vehicleProvider.isSimulating || vehicleProvider.isPaused || _selectedUserEmail == null) return;
+    if (vehicleProvider.isSimulating || vehicleProvider.isPaused || _selectedUserEmail == null || _isProcessingRemoteNav) return;
     
     if (_isEditingLocation) {
       await vehicleProvider.manuallyUpdatePosition(_selectedUserEmail!, latlng);
@@ -113,40 +177,33 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    // --- MODIFIED: Tapping only sets the destination, does not calculate route ---
     setState(() {
       _destinationPoint = latlng;
-      _routePoints = []; // Clear any old route line
+      _routePoints = [];
       _mapInstruction = "Destination set. Press Start to begin trip.";
     });
   }
-
-  // MODIFIED: Returns a boolean indicating success
-  Future<bool> _calculateAndDrawRoute() async {
+  
+  Future<List<LatLng>?> _calculateAndDrawRoute([LatLng? startPointOverride]) async {
     final vehicleProvider = Provider.of<VehicleProvider>(context, listen: false);
-    final startPoint = LatLng(vehicleProvider.vehicle.latitude, vehicleProvider.vehicle.longitude);
-    if (_destinationPoint == null) return false;
-
+    final startPoint = startPointOverride ?? LatLng(vehicleProvider.vehicle.latitude, vehicleProvider.vehicle.longitude);
+    
+    if (_destinationPoint == null) return null;
     final apiService = Provider.of<ApiService>(context, listen: false);
     try {
       final points = await apiService.getRoute(startPoint, _destinationPoint!);
       if (points.isNotEmpty && mounted) {
-        setState(() {
-          _routePoints = points;
-        });
+        setState(() { _routePoints = points; });
         _mapController.fitCamera(CameraFit.bounds(bounds: LatLngBounds.fromPoints(points), padding: const EdgeInsets.all(50)));
-        return true; // Success
-      } else {
+        return points;
+      } else { 
         throw Exception("No route found");
       }
     } catch (e) {
-      if (!mounted) return false;
-      setState(() {
-        _destinationPoint = null;
-        _mapInstruction = "Could not find a route. Please pick a new destination.";
-      });
+      if (!mounted) return null;
+      setState(() { _destinationPoint = null; _mapInstruction = "Could not find a route. Pick a new destination."; });
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error calculating route: $e')));
-      return false; // Failure
+      return null;
     }
   }
 
@@ -154,6 +211,13 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final vehicleProvider = Provider.of<VehicleProvider>(context);
     final stationProvider = Provider.of<StationProvider>(context);
+
+    if (!vehicleProvider.isSimulating && !vehicleProvider.isPaused && _selectedUserEmail != null) {
+      final providerValue = vehicleProvider.vehicle.batteryLevel.toStringAsFixed(0);
+      if (_batteryController.text != providerValue) {
+        _batteryController.text = providerValue;
+      }
+    }
 
     return Scaffold(
       body: _isLoading
@@ -170,7 +234,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     MarkerLayer(markers: _buildMarkers(vehicleProvider.vehicle, stationProvider.stations)),
                   ],
                 ),
-                if (_userEmails.isNotEmpty) _buildUserSelector(vehicleProvider.isSimulating || vehicleProvider.isPaused),
+                if (_userEmails.isNotEmpty) _buildUserSelector(vehicleProvider.isSimulating || vehicleProvider.isPaused || _isProcessingRemoteNav),
                 _buildControlPanel(vehicleProvider),
               ],
             ),
@@ -201,12 +265,10 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildControlPanel(VehicleProvider vehicleProvider) {
     final isSimulating = vehicleProvider.isSimulating;
     final isPaused = vehicleProvider.isPaused;
-    // MODIFIED: Can start if a destination is set
     final canStart = _destinationPoint != null && !isSimulating && !isPaused && _selectedUserEmail != null;
 
     Widget actionButton;
     Widget secondaryButton;
-
     if (isSimulating) {
       actionButton = _buildActionButton(icon: Icons.pause_rounded, text: 'Pause', color: Colors.amber.shade700,
         onPressed: () { vehicleProvider.pauseSimulation(_selectedUserEmail!); }
@@ -218,13 +280,12 @@ class _HomeScreenState extends State<HomeScreen> {
     } else {
        actionButton = _buildActionButton(
         icon: Icons.play_arrow_rounded, text: 'Start', color: Colors.green.shade600,
-        // --- MODIFIED: Start button now triggers route calculation ---
-        onPressed: !canStart ? null : () async {
+        onPressed: !canStart || _isProcessingRemoteNav ? null : () async {
           setState(() { _mapInstruction = "Calculating route..."; });
-          bool success = await _calculateAndDrawRoute();
-          if (success) {
+          final newRoute = await _calculateAndDrawRoute();
+          if (newRoute != null) {
             vehicleProvider.startSimulation(
-              route: _routePoints, userEmail: _selectedUserEmail!,
+              route: newRoute, userEmail: _selectedUserEmail!,
               initialBattery: vehicleProvider.vehicle.batteryLevel,
               initialSpeedKmh: _vehicleSpeedKmh, initialDrainRate: _drainRatePerMinute,
             );
@@ -236,7 +297,7 @@ class _HomeScreenState extends State<HomeScreen> {
     
     secondaryButton = _buildActionButton(icon: Icons.stop_rounded, text: 'End Trip', color: Colors.red.shade600,
       onPressed: (!isSimulating && !isPaused) || _selectedUserEmail == null ? null : () {
-        vehicleProvider.stopSimulation(_selectedUserEmail!);
+        vehicleProvider.stopAndEndTrip(_selectedUserEmail!);
         setState(() {
           _destinationPoint = null;
           _routePoints = [];
@@ -257,7 +318,7 @@ class _HomeScreenState extends State<HomeScreen> {
               children: [
                 Row(
                   children: [
-                    Expanded(flex: 2, child: Column(crossAxisAlignment: CrossAxisAlignment.center, children: [
+                    Expanded(flex: 3, child: Column(crossAxisAlignment: CrossAxisAlignment.center, children: [
                         Text("LIVE BATTERY", style: Theme.of(context).textTheme.labelSmall),
                         Row(mainAxisAlignment: MainAxisAlignment.center, children: [
                             Icon(vehicleProvider.vehicle.batteryLevel > 20 ? Icons.battery_full_rounded : Icons.battery_alert_rounded, color: vehicleProvider.vehicle.batteryLevel > 20 ? Colors.green.shade700 : Colors.red.shade700),
@@ -268,16 +329,34 @@ class _HomeScreenState extends State<HomeScreen> {
                       ],
                     )),
                     const SizedBox(width: 16),
-                    TextButton.icon(
-                      onPressed: isSimulating || isPaused || _selectedUserEmail == null ? null : () {
-                        setState(() {
-                          _isEditingLocation = !_isEditingLocation;
-                          _mapInstruction = _isEditingLocation ? "Tap map to set new vehicle position." : "Set Position mode cancelled.";
-                        });
-                      },
-                      icon: Icon(_isEditingLocation ? Icons.cancel : Icons.edit_location_alt_rounded),
-                      label: Text(_isEditingLocation ? "Cancel" : "Set Position"),
-                      style: TextButton.styleFrom(foregroundColor: Colors.white, backgroundColor: _isEditingLocation ? Colors.red.shade400 : Theme.of(context).primaryColor),
+                    Expanded(
+                      flex: 4,
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: _batteryController,
+                              enabled: !isSimulating && !isPaused && _selectedUserEmail != null,
+                              textAlign: TextAlign.center,
+                              decoration: const InputDecoration(labelText: 'Set Battery', suffixText: '%', isDense: true, border: OutlineInputBorder()),
+                              keyboardType: TextInputType.number,
+                              inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)],
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.check_circle),
+                            color: Theme.of(context).primaryColor,
+                            tooltip: 'Set Battery Level',
+                            onPressed: isSimulating || isPaused || _selectedUserEmail == null ? null : () {
+                              final newLevel = double.tryParse(_batteryController.text);
+                              if (newLevel != null) {
+                                vehicleProvider.manuallyUpdateBattery(_selectedUserEmail!, newLevel);
+                                FocusScope.of(context).unfocus();
+                              }
+                            },
+                          )
+                        ],
+                      ),
                     ),
                   ],
                 ),
@@ -296,7 +375,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 TextButton.icon(
                   icon: const Icon(Icons.refresh_rounded, size: 20), label: const Text('Reset Vehicle (100% Bat)'),
                   style: TextButton.styleFrom(foregroundColor: Colors.grey.shade700),
-                  onPressed: isSimulating || isPaused || _selectedUserEmail == null ? null : () {
+                  onPressed: isSimulating || isPaused || _selectedUserEmail == null || _isProcessingRemoteNav ? null : () {
                     vehicleProvider.resetSimulation(_selectedUserEmail!);
                     setState(() { _routePoints = []; _destinationPoint = null; _mapInstruction = "Vehicle reset. Set a new destination."; });
                   },
@@ -311,9 +390,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildActionButton({required IconData icon, required String text, required Color color, required VoidCallback? onPressed}) {
     return ElevatedButton.icon(
-      icon: Icon(icon), label: Text(text),
+      icon: Icon(icon),
+      label: Text(text),
       style: ElevatedButton.styleFrom(
-        foregroundColor: Colors.white, backgroundColor: color,
+        foregroundColor: Colors.white,
+        backgroundColor: color,
         padding: const EdgeInsets.symmetric(vertical: 12),
         disabledBackgroundColor: color.withOpacity(0.4),
       ),
@@ -327,7 +408,10 @@ class _HomeScreenState extends State<HomeScreen> {
       children: [
         Text("Vehicle Speed: ${_vehicleSpeedKmh.round()} km/h", style: Theme.of(context).textTheme.labelMedium),
         Slider(
-          value: _vehicleSpeedKmh, min: 5, max: 140, divisions: 27,
+          value: _vehicleSpeedKmh,
+          min: 5,
+          max: 140,
+          divisions: 27,
           label: "${_vehicleSpeedKmh.round()} km/h",
           onChanged: (value) {
             setState(() => _vehicleSpeedKmh = value);
@@ -337,14 +421,17 @@ class _HomeScreenState extends State<HomeScreen> {
       ],
     );
   }
-  
+
   Widget _buildDrainSlider(VehicleProvider vehicleProvider) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text("Battery Drain: ${_drainRatePerMinute.toStringAsFixed(1)}% per minute", style: Theme.of(context).textTheme.labelMedium),
         Slider(
-          value: _drainRatePerMinute, min: 0.5, max: 20.0, divisions: 39,
+          value: _drainRatePerMinute,
+          min: 0.5,
+          max: 20.0,
+          divisions: 39,
           label: "${_drainRatePerMinute.toStringAsFixed(1)}%",
           onChanged: (value) {
             setState(() => _drainRatePerMinute = value);

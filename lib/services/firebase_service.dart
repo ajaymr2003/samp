@@ -1,5 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_database/firebase_database.dart';
+import '../models/navigation_request_model.dart';
 import '../models/station_model.dart';
 import '../models/vehicle_model.dart';
 
@@ -22,8 +23,6 @@ class FirebaseService {
     }
   }
   
-  // --- CORRECTED VEHICLE METHODS ---
-
   Stream<Vehicle> getVehicleStream({required String email}) {
     final encodedEmail = _encodeEmail(email);
     final vehicleRef = _database.ref('vehicles/$encodedEmail');
@@ -33,7 +32,6 @@ class FirebaseService {
         final data = Map<String, dynamic>.from(event.snapshot.value as Map);
         return Vehicle.fromJson(data);
       } else {
-        // If no data exists, return the default initial state.
         return Vehicle.initial();
       }
     });
@@ -86,5 +84,25 @@ class FirebaseService {
       batch.update(stationRef, {'slots': updatedSlotsJson});
     }
     await batch.commit();
+  }
+
+  // --- NAVIGATION METHODS ---
+
+  Stream<NavigationRequest?> getNavigationStream({required String email}) {
+    return _firestore.collection('navigation').doc(email).snapshots().map((doc) {
+      if (doc.exists) {
+        return NavigationRequest.fromFirestore(doc);
+      }
+      return null;
+    });
+  }
+
+  Future<void> endNavigation({required String email}) async {
+    try {
+      final navRef = _firestore.collection('navigation').doc(email);
+      await navRef.update({'isNavigating': false, 'vehicleReachedStation': false});
+    } catch (e) {
+      print("Could not end navigation (might not exist): $e");
+    }
   }
 }
