@@ -5,11 +5,13 @@ class NavigationRequest {
   final LatLng start;
   final LatLng end;
   final bool isNavigating;
+  final String? destinationStationId; // <-- NEW
 
   NavigationRequest({
     required this.start,
     required this.end,
     required this.isNavigating,
+    this.destinationStationId, // <-- NEW
   });
 
   factory NavigationRequest.fromFirestore(DocumentSnapshot doc) {
@@ -24,6 +26,7 @@ class NavigationRequest {
         (data['end_lng'] ?? 0.0).toDouble(),
       ),
       isNavigating: data['isNavigating'] ?? false,
+      destinationStationId: data['destinationStationId'], // <-- NEW
     );
   }
 }

@@ -88,6 +88,15 @@ class FirebaseService {
       throw Exception('Failed to load stations.');
     }
   }
+
+  Stream<Station?> getStationStream(String stationId) {
+    return _firestore.collection('stations').doc(stationId).snapshots().map((doc) {
+      if (doc.exists && doc.data() != null) {
+        return Station.fromJson(doc.data()!..['id'] = doc.id);
+      }
+      return null;
+    });
+  }
   
   Future<void> updateSlotStatus({
     required String stationId,
@@ -133,6 +142,25 @@ class FirebaseService {
       print("Could not end navigation (might not exist): $e");
     }
   }
+  
+  // --- NEW: Specific method to cancel navigation when a station is full ---
+  Future<void> cancelNavigationForFullStation({
+    required String email,
+    required String stationName,
+  }) async {
+    try {
+      final navRef = _firestore.collection('navigation').doc(email);
+      await navRef.update({
+        'isNavigating': false,
+        'vehicleReachedStation': false,
+        'cancellationReason': 'STATION_FULL',
+        'cancelledStationName': stationName,
+      });
+      print("Navigation document for $email updated: cancelled because station '$stationName' is full.");
+    } catch (e) {
+      print("Could not update navigation document for full station: $e");
+    }
+  }
 
   // --- USER SETTINGS & NOTIFICATION METHODS ---
   Future<UserModel?> getUserSettings(String email) async {
@@ -145,6 +173,56 @@ class FirebaseService {
       print("Error fetching user settings: $e");
     }
     return null;
+  }
+
+  Future<void> sendStationFullNotification({
+    required String fcmToken,
+    required String stationName,
+  }) async {
+    if (fcmToken.isEmpty) {
+      print("FCM token is empty. Cannot send notification.");
+      return;
+    }
+
+    final accessToken = await _getAccessToken();
+    if (accessToken == null) {
+      print("Failed to get access token. Cannot send notification.");
+      return;
+    }
+
+    final String url = 'https://fcm.googleapis.com/v1/projects/$_projectId/messages:send';
+
+    final Map<String, dynamic> message = {
+      'message': {
+        'token': fcmToken,
+        'notification': {
+          'title': 'Destination Full!',
+          'body': 'Your destination station "$stationName" has no available slots. Your trip has been cancelled.',
+        },
+        'data': {
+          'type': 'STATION_FULL',
+          'stationName': stationName,
+        }
+      }
+    };
+
+    try {
+      final response = await http.post(
+        Uri.parse(url),
+        headers: <String, String>{
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $accessToken',
+        },
+        body: jsonEncode(message),
+      );
+      if (response.statusCode == 200) {
+        print("Successfully sent station full notification via V1 API.");
+      } else {
+        print("Failed to send V1 notification: ${response.statusCode} - ${response.body}");
+      }
+    } catch (e) {
+      print("Error sending V1 FCM notification: $e");
+    }
   }
 
   Future<void> sendLowBatteryNotification({

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:latlong2/latlong.dart' as latlong;
+import '../models/station_model.dart'; 
 import '../models/user_model.dart';
 import '../models/vehicle_model.dart';
 import '../services/firebase_service.dart';
@@ -25,6 +26,10 @@ class VehicleProvider with ChangeNotifier {
   // --- State for notification logic ---
   UserModel? _userSettings;
   bool _notificationSent = false;
+  // --- NEW: Station monitoring state ---
+  StreamSubscription? _stationStatusSubscription;
+  bool _stationFullNotificationSent = false;
+
 
   // --- Dynamic Simulation Parameters ---
   double _vehicleSpeedKmh = 60.0;
@@ -79,10 +84,23 @@ class VehicleProvider with ChangeNotifier {
     required double initialBattery,
     required double initialSpeedKmh,
     required double initialDrainRate,
+    String? destinationStationId, 
   }) {
     if (isSimulating || route.isEmpty) return;
 
-    _notificationSent = false; // Reset notification flag on new trip
+    _notificationSent = false; 
+    _stationFullNotificationSent = false; 
+
+    // Cancel any previous station subscription
+    _stationStatusSubscription?.cancel();
+    _stationStatusSubscription = null;
+
+    if (destinationStationId != null) {
+      print("Monitoring destination station: $destinationStationId");
+      _stationStatusSubscription = _firebaseService
+          .getStationStream(destinationStationId)
+          .listen(_onStationStatusChanged);
+    }
 
     _vehicleSpeedKmh = initialSpeedKmh;
     _drainRatePerMinute = initialDrainRate;
@@ -120,6 +138,8 @@ class VehicleProvider with ChangeNotifier {
 
   void forceStopForOverride(String userEmail) {
     if (!isSimulating && !isPaused) return;
+    _stationStatusSubscription?.cancel(); 
+    _stationStatusSubscription = null;
     _stopSimulationTimer(clearRoute: true);
     final stoppedVehicleState = _vehicle.copyWith(isRunning: false, isPaused: false);
     _firebaseService.updateVehicleState(email: userEmail, vehicle: stoppedVehicleState);
@@ -140,6 +160,42 @@ class VehicleProvider with ChangeNotifier {
     stopAndEndTrip(userEmail);
     final resetState = _vehicle.copyWith(batteryLevel: 100.0, isRunning: false, isPaused: false);
     await _firebaseService.updateVehicleState(email: userEmail, vehicle: resetState);
+  }
+
+  void _onStationStatusChanged(Station? station) {
+    final userEmail = _currentUserEmail;
+    if (userEmail == null ||
+        station == null ||
+        !isSimulating ||
+        _stationFullNotificationSent) {
+      return;
+    }
+
+    if (station.availableSlots == 0) {
+      print("Destination station '${station.name}' is now full. Cancelling trip.");
+      _stationFullNotificationSent = true;
+
+      if (_userSettings != null && _userSettings!.fcmToken.isNotEmpty) {
+        _firebaseService.sendStationFullNotification(
+          fcmToken: _userSettings!.fcmToken,
+          stationName: station.name,
+        );
+      }
+
+      // --- MODIFIED: Use new, specific cancellation logic ---
+      // 1. Stop the local simulation timer and update the vehicle's state
+      forceStopForOverride(userEmail);
+      
+      // 2. Update the navigation document in Firestore with a specific reason
+      _firebaseService.cancelNavigationForFullStation(
+        email: userEmail,
+        stationName: station.name,
+      );
+      // --- END MODIFICATION ---
+
+      _stationStatusSubscription?.cancel();
+      _stationStatusSubscription = null;
+    }
   }
 
   void _onTick(String userEmail) {
@@ -215,6 +271,7 @@ class VehicleProvider with ChangeNotifier {
   void dispose() {
     _simulationTimer?.cancel();
     _vehicleSubscription?.cancel();
+    _stationStatusSubscription?.cancel(); 
     super.dispose();
   }
 }

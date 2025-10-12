@@ -137,6 +137,7 @@ class _HomeScreenState extends State<HomeScreen> {
         initialBattery: vehicleProvider.vehicle.batteryLevel,
         initialSpeedKmh: _vehicleSpeedKmh,
         initialDrainRate: _drainRatePerMinute,
+        destinationStationId: navRequest.destinationStationId, // <-- MODIFIED
       );
       setState(() { _mapInstruction = "AUTOMATIC TRIP IN PROGRESS..."; });
     } else {
