@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:latlong2/latlong.dart' as latlong;
-import '../models/station_model.dart'; 
 import '../models/user_model.dart';
 import '../models/vehicle_model.dart';
 import '../services/firebase_service.dart';
@@ -26,7 +25,7 @@ class VehicleProvider with ChangeNotifier {
   // --- State for notification logic ---
   UserModel? _userSettings;
   bool _notificationSent = false;
-  // --- NEW: Station monitoring state ---
+  // --- Station monitoring state ---
   StreamSubscription? _stationStatusSubscription;
   bool _stationFullNotificationSent = false;
 
@@ -91,15 +90,15 @@ class VehicleProvider with ChangeNotifier {
     _notificationSent = false; 
     _stationFullNotificationSent = false; 
 
-    // Cancel any previous station subscription
     _stationStatusSubscription?.cancel();
     _stationStatusSubscription = null;
 
+    // --- MODIFIED: Use the fast RTDB stream for monitoring ---
     if (destinationStationId != null) {
-      print("Monitoring destination station: $destinationStationId");
+      print("Monitoring destination station via RTDB: $destinationStationId");
       _stationStatusSubscription = _firebaseService
-          .getStationStream(destinationStationId)
-          .listen(_onStationStatusChanged);
+          .getStationStatusStreamRTDB(destinationStationId)
+          .listen((slots) => _onStationStatusChangedRTDB(slots, destinationStationId));
     }
 
     _vehicleSpeedKmh = initialSpeedKmh;
@@ -162,43 +161,41 @@ class VehicleProvider with ChangeNotifier {
     await _firebaseService.updateVehicleState(email: userEmail, vehicle: resetState);
   }
 
-  void _onStationStatusChanged(Station? station) {
+  // --- NEW: Listener for the RTDB stream ---
+  void _onStationStatusChangedRTDB(List<bool>? availableSlots, String stationId) async {
     final userEmail = _currentUserEmail;
     if (userEmail == null ||
-        station == null ||
         !isSimulating ||
         _stationFullNotificationSent) {
       return;
     }
 
-    if (station.availableSlots == 0) {
-      print("Destination station '${station.name}' is now full. Cancelling trip.");
+    // A station is full if the list of available slots does not contain 'true'
+    if (availableSlots != null && !availableSlots.contains(true)) {
+      final stationName = await _firebaseService.getStationName(stationId);
+      print("Destination station '$stationName' is now full (via RTDB). Cancelling trip.");
       _stationFullNotificationSent = true;
 
       if (_userSettings != null && _userSettings!.fcmToken.isNotEmpty) {
         _firebaseService.sendStationFullNotification(
           fcmToken: _userSettings!.fcmToken,
-          stationName: station.name,
+          stationName: stationName,
         );
       }
-
-      // --- MODIFIED: Use new, specific cancellation logic ---
-      // 1. Stop the local simulation timer and update the vehicle's state
-      forceStopForOverride(userEmail);
       
-      // 2. Update the navigation document in Firestore with a specific reason
+      forceStopForOverride(userEmail);
       _firebaseService.cancelNavigationForFullStation(
         email: userEmail,
-        stationName: station.name,
+        stationName: stationName,
       );
-      // --- END MODIFICATION ---
-
+      
       _stationStatusSubscription?.cancel();
       _stationStatusSubscription = null;
     }
   }
 
   void _onTick(String userEmail) {
+    // ... (This method remains unchanged) ...
     final lastTick = _lastTickTime;
     final startTime = _startTime;
     if (startTime == null || lastTick == null || _route.length < 2) { return; }

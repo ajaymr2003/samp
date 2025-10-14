@@ -1,3 +1,5 @@
+// lib/services/firebase_service.dart ---
+
 import 'dart:convert';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -13,10 +15,11 @@ class FirebaseService {
   final FirebaseDatabase _database = FirebaseDatabase.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
+  // --- NEW: Path for RTDB station status data ---
+  final String _rtdbStationStatusPath = 'station_status';
+
   // --- V1 API CONFIGURATION ---
-  // IMPORTANT: Replace with the actual name of your JSON file.
   final String _serviceAccountJsonPath = 'credentials/serviceAccountKey.json';
-  // IMPORTANT: Replace with your actual Project ID from Firebase Settings.
   final String _projectId = 'miniproject-c03ff';
 
   // --- Method to get an OAuth 2.0 Access Token ---
@@ -78,6 +81,8 @@ class FirebaseService {
   }
 
   // --- STATION DATA METHODS ---
+
+  // Fetches static station data from Firestore (Source of Truth)
   Future<List<Station>> getStations() async {
     try {
       final snapshot = await _firestore.collection('stations').orderBy('name').get();
@@ -89,15 +94,47 @@ class FirebaseService {
     }
   }
 
-  Stream<Station?> getStationStream(String stationId) {
-    return _firestore.collection('stations').doc(stationId).snapshots().map((doc) {
-      if (doc.exists && doc.data() != null) {
-        return Station.fromJson(doc.data()!..['id'] = doc.id);
+  // NEW: Gets a single station's name from Firestore (for notifications)
+  Future<String> getStationName(String stationId) async {
+    try {
+      final doc = await _firestore.collection('stations').doc(stationId).get();
+      if (doc.exists) {
+        return doc.data()?['name'] ?? 'Unknown Station';
       }
-      return null;
+    } catch (e) {
+      print("Error fetching station name: $e");
+    }
+    return 'Unknown Station';
+  }
+
+  // NEW: Initializes/Syncs the RTDB structure from Firestore data
+  Future<void> initializeStationStatusInRTDB(List<Station> stations) async {
+    if (stations.isEmpty) return;
+    try {
+      final Map<String, dynamic> updates = {};
+      for (final station in stations) {
+        final slotStatusList = station.slots.map((s) => s.isAvailable).toList();
+        updates['$_rtdbStationStatusPath/${station.id}'] = slotStatusList;
+      }
+      await _database.ref().update(updates);
+      print("Successfully initialized/updated station statuses in Realtime Database.");
+    } catch (e) {
+      print("Error initializing station status in RTDB: $e");
+    }
+  }
+
+  // NEW: RTDB Stream for Vehicle Provider to get real-time slot status
+  Stream<List<bool>?> getStationStatusStreamRTDB(String stationId) {
+    return _database.ref('$_rtdbStationStatusPath/$stationId').onValue.map((event) {
+      if (event.snapshot.exists && event.snapshot.value != null) {
+        final data = List<dynamic>.from(event.snapshot.value as List);
+        return data.map((e) => e as bool).toList();
+      }
+      return null; // Station might not exist in RTDB yet
     });
   }
   
+  // MODIFIED: Now updates both Firestore and RTDB for consistency
   Future<void> updateSlotStatus({
     required String stationId,
     required int slotIndex,
@@ -109,19 +146,35 @@ class FirebaseService {
       List<dynamic> slots = doc.data()?['slots'] ?? [];
       if (slotIndex < slots.length) {
         slots[slotIndex]['isAvailable'] = isAvailable;
+        // Update Firestore (source of truth)
         await stationRef.update({'slots': slots});
+        // Update RTDB (for fast real-time listeners)
+        await _database.ref('$_rtdbStationStatusPath/$stationId/$slotIndex').set(isAvailable);
       }
     }
   }
 
+  // MODIFIED: Now updates both Firestore and RTDB for consistency
   Future<void> applyPreset(List<Station> updatedStations) async {
-    final batch = _firestore.batch();
+    final firestoreBatch = _firestore.batch();
+    final Map<String, dynamic> rtdbUpdates = {};
+
     for (var station in updatedStations) {
+      // Prepare Firestore update
       final stationRef = _firestore.collection('stations').doc(station.id);
       final updatedSlotsJson = station.slots.map((s) => s.toJson()).toList();
-      batch.update(stationRef, {'slots': updatedSlotsJson});
+      firestoreBatch.update(stationRef, {'slots': updatedSlotsJson});
+      
+      // Prepare RTDB update
+      final slotStatusList = station.slots.map((s) => s.isAvailable).toList();
+      rtdbUpdates['$_rtdbStationStatusPath/${station.id}'] = slotStatusList;
     }
-    await batch.commit();
+
+    // Commit both updates atomically
+    await Future.wait([
+      firestoreBatch.commit(),
+      _database.ref().update(rtdbUpdates)
+    ]);
   }
 
   // --- NAVIGATION METHODS ---
@@ -134,16 +187,22 @@ class FirebaseService {
     });
   }
 
+  // --- MODIFIED: This method now correctly resets all cancellation-related fields ---
   Future<void> endNavigation({required String email}) async {
     try {
       final navRef = _firestore.collection('navigation').doc(email);
-      await navRef.update({'isNavigating': false, 'vehicleReachedStation': false});
+      await navRef.update({
+        'isNavigating': false,
+        'vehicleReachedStation': false,
+        'cancellationReason': FieldValue.delete(), // Clears the field
+        'cancelledStationName': FieldValue.delete(), // Clears the field
+        'stationIsFull': FieldValue.delete(), // Clears the field
+      });
     } catch (e) {
       print("Could not end navigation (might not exist): $e");
     }
   }
   
-  // --- NEW: Specific method to cancel navigation when a station is full ---
   Future<void> cancelNavigationForFullStation({
     required String email,
     required String stationName,
@@ -155,6 +214,7 @@ class FirebaseService {
         'vehicleReachedStation': false,
         'cancellationReason': 'STATION_FULL',
         'cancelledStationName': stationName,
+        'stationIsFull': true, // Sets the field
       });
       print("Navigation document for $email updated: cancelled because station '$stationName' is full.");
     } catch (e) {
@@ -183,15 +243,10 @@ class FirebaseService {
       print("FCM token is empty. Cannot send notification.");
       return;
     }
-
     final accessToken = await _getAccessToken();
-    if (accessToken == null) {
-      print("Failed to get access token. Cannot send notification.");
-      return;
-    }
+    if (accessToken == null) return;
 
     final String url = 'https://fcm.googleapis.com/v1/projects/$_projectId/messages:send';
-
     final Map<String, dynamic> message = {
       'message': {
         'token': fcmToken,
@@ -199,30 +254,14 @@ class FirebaseService {
           'title': 'Destination Full!',
           'body': 'Your destination station "$stationName" has no available slots. Your trip has been cancelled.',
         },
-        'data': {
-          'type': 'STATION_FULL',
-          'stationName': stationName,
-        }
+        'data': { 'type': 'STATION_FULL', 'stationName': stationName }
       }
     };
-
     try {
-      final response = await http.post(
-        Uri.parse(url),
-        headers: <String, String>{
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $accessToken',
-        },
-        body: jsonEncode(message),
-      );
-      if (response.statusCode == 200) {
-        print("Successfully sent station full notification via V1 API.");
-      } else {
-        print("Failed to send V1 notification: ${response.statusCode} - ${response.body}");
-      }
-    } catch (e) {
-      print("Error sending V1 FCM notification: $e");
-    }
+      final response = await http.post(Uri.parse(url), headers: <String, String>{ 'Content-Type': 'application/json', 'Authorization': 'Bearer $accessToken' }, body: jsonEncode(message));
+      if (response.statusCode == 200) { print("Successfully sent station full notification via V1 API."); } 
+      else { print("Failed to send V1 notification: ${response.statusCode} - ${response.body}"); }
+    } catch (e) { print("Error sending V1 FCM notification: $e"); }
   }
 
   Future<void> sendLowBatteryNotification({
@@ -233,15 +272,10 @@ class FirebaseService {
       print("FCM token is empty. Cannot send notification.");
       return;
     }
-
     final accessToken = await _getAccessToken();
-    if (accessToken == null) {
-      print("Failed to get access token. Cannot send notification.");
-      return;
-    }
-
+    if (accessToken == null) return;
+    
     final String url = 'https://fcm.googleapis.com/v1/projects/$_projectId/messages:send';
-
     final Map<String, dynamic> message = {
       'message': {
         'token': fcmToken,
@@ -251,23 +285,10 @@ class FirebaseService {
         },
       }
     };
-
     try {
-      final response = await http.post(
-        Uri.parse(url),
-        headers: <String, String>{
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $accessToken',
-        },
-        body: jsonEncode(message),
-      );
-      if (response.statusCode == 200) {
-        print("Successfully sent low battery notification via V1 API.");
-      } else {
-        print("Failed to send V1 notification: ${response.statusCode} - ${response.body}");
-      }
-    } catch (e) {
-      print("Error sending V1 FCM notification: $e");
-    }
+      final response = await http.post(Uri.parse(url), headers: <String, String>{'Content-Type': 'application/json', 'Authorization': 'Bearer $accessToken'}, body: jsonEncode(message));
+      if (response.statusCode == 200) { print("Successfully sent low battery notification via V1 API."); } 
+      else { print("Failed to send V1 notification: ${response.statusCode} - ${response.body}"); }
+    } catch (e) { print("Error sending V1 FCM notification: $e"); }
   }
 }

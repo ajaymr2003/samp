@@ -1,3 +1,5 @@
+//lib/models/navigation_request_model.dart ---
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:latlong2/latlong.dart';
 
@@ -5,13 +7,19 @@ class NavigationRequest {
   final LatLng start;
   final LatLng end;
   final bool isNavigating;
-  final String? destinationStationId; // <-- NEW
+  final String? destinationStationId;
+  final bool stationIsFull; // --- MODIFIED: New field ---
+  final String? cancellationReason; // --- MODIFIED: New field ---
+  final String? cancelledStationName; // --- MODIFIED: New field ---
 
   NavigationRequest({
     required this.start,
     required this.end,
     required this.isNavigating,
-    this.destinationStationId, // <-- NEW
+    this.destinationStationId,
+    this.stationIsFull = false, // --- MODIFIED: Added to constructor ---
+    this.cancellationReason, // --- MODIFIED: Added to constructor ---
+    this.cancelledStationName, // --- MODIFIED: Added to constructor ---
   });
 
   factory NavigationRequest.fromFirestore(DocumentSnapshot doc) {
@@ -26,7 +34,10 @@ class NavigationRequest {
         (data['end_lng'] ?? 0.0).toDouble(),
       ),
       isNavigating: data['isNavigating'] ?? false,
-      destinationStationId: data['destinationStationId'], // <-- NEW
+      destinationStationId: data['destinationStationId'],
+      stationIsFull: data['stationIsFull'] ?? false, // --- MODIFIED: Parse from Firestore ---
+      cancellationReason: data['cancellationReason'], // --- MODIFIED: Parse from Firestore ---
+      cancelledStationName: data['cancelledStationName'], // --- MODIFIED: Parse from Firestore ---
     );
   }
 }

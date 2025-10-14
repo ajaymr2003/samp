@@ -1,3 +1,5 @@
+//lib/screens/home_screen.dart ---
+
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -40,9 +42,11 @@ class _HomeScreenState extends State<HomeScreen> {
   double _vehicleSpeedKmh = 60.0;
   double _drainRatePerMinute = 1.0;
   
-  // State for handling remote navigation
+  // --- MODIFIED: State for handling remote navigation ---
+  // This subscription stays active, making the simulator "always ready".
   StreamSubscription? _navigationSubscription;
-  bool _isProcessingRemoteNav = false; // State lock for remote commands
+  // This state lock prevents race conditions and conflicts with manual actions.
+  bool _isProcessingRemoteNav = false;
 
   @override
   void initState() {
@@ -80,6 +84,8 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() { _selectedUserEmail = email; });
     vehicleProvider.initialize(email);
     
+    // --- KEY BEHAVIOR: Start listening for remote commands immediately ---
+    // This makes the simulator "always ready" for the selected user.
     _listenForRemoteNavigation(email);
 
     final vehicleStream = _firebaseService.getVehicleStream(email: email);
@@ -97,14 +103,19 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
+  /// Sets up a continuous listener on the user's navigation document in Firestore.
   void _listenForRemoteNavigation(String email) {
     _navigationSubscription?.cancel();
     _navigationSubscription = _firebaseService.getNavigationStream(email: email).listen((navRequest) {
+      // --- TRIGGER: A remote command has been issued ---
       if (navRequest != null && navRequest.isNavigating && !_isProcessingRemoteNav) {
+        // A new navigation has been requested, and we are not already processing one.
         _startRemoteNavigation(navRequest);
       } 
+      // --- RESET: The remote command has ended or been cancelled ---
       else if (navRequest == null || !navRequest.isNavigating) {
          if (_isProcessingRemoteNav) {
+          // If we were in a remote navigation, unlock the UI for manual control.
           setState(() {
             _isProcessingRemoteNav = false;
             _destinationPoint = null;
@@ -116,31 +127,42 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
+  /// This function handles the interruption and start of a new automated trip.
   Future<void> _startRemoteNavigation(NavigationRequest navRequest) async {
     final vehicleProvider = Provider.of<VehicleProvider>(context, listen: false);
 
     setState(() {
+      // 1. Lock the UI to prevent manual interference.
       _isProcessingRemoteNav = true;
+      
+      // 2. CRITICAL: Immediately stop any currently running simulation or paused state.
+      // This ensures the new remote command takes absolute priority.
       if (vehicleProvider.isSimulating || vehicleProvider.isPaused) {
         vehicleProvider.forceStopForOverride(_selectedUserEmail!);
       }
+      
+      // 3. Update the UI to reflect the new remote command.
       _mapInstruction = "REMOTE COMMAND: Calculating route...";
       _destinationPoint = navRequest.end;
       _routePoints = [];
     });
 
+    // 4. Calculate the route for the new trip.
     final newRoute = await _calculateAndDrawRoute(navRequest.start);
+    
     if (newRoute != null) {
+      // 5. Start the new simulation with the calculated route.
       vehicleProvider.startSimulation(
         route: newRoute,
         userEmail: _selectedUserEmail!,
         initialBattery: vehicleProvider.vehicle.batteryLevel,
         initialSpeedKmh: _vehicleSpeedKmh,
         initialDrainRate: _drainRatePerMinute,
-        destinationStationId: navRequest.destinationStationId, // <-- MODIFIED
+        destinationStationId: navRequest.destinationStationId,
       );
       setState(() { _mapInstruction = "AUTOMATIC TRIP IN PROGRESS..."; });
     } else {
+      // 6. If routing fails, reset the state in Firebase and unlock the UI.
       await _firebaseService.endNavigation(email: _selectedUserEmail!);
       setState(() { 
         _mapInstruction = "Failed to calculate remote route.";
@@ -167,6 +189,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _onMapTap(TapPosition pos, LatLng latlng) async {
     final vehicleProvider = Provider.of<VehicleProvider>(context, listen: false);
+    // --- GUARD: Prevents map interaction during a remote-controlled trip ---
     if (vehicleProvider.isSimulating || vehicleProvider.isPaused || _selectedUserEmail == null || _isProcessingRemoteNav) return;
     
     if (_isEditingLocation) {
@@ -281,6 +304,7 @@ class _HomeScreenState extends State<HomeScreen> {
     } else {
        actionButton = _buildActionButton(
         icon: Icons.play_arrow_rounded, text: 'Start', color: Colors.green.shade600,
+        // --- GUARD: Prevents manual start during a remote-controlled trip ---
         onPressed: !canStart || _isProcessingRemoteNav ? null : () async {
           setState(() { _mapInstruction = "Calculating route..."; });
           final newRoute = await _calculateAndDrawRoute();

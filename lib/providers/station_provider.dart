@@ -20,6 +20,8 @@ class StationProvider with ChangeNotifier {
     notifyListeners();
     try {
       _stations = await _firebaseService.getStations();
+      // --- NEW: Initialize the Realtime Database with the fetched station statuses ---
+      await _firebaseService.initializeStationStatusInRTDB(_stations);
     } catch (e) {
       print("Error fetching stations in provider: $e");
     } finally {
@@ -33,7 +35,7 @@ class StationProvider with ChangeNotifier {
     station.slots[slotIndex] = station.slots[slotIndex].copyWith(isAvailable: isAvailable);
     notifyListeners();
 
-    // Actual DB call
+    // Actual DB call (now updates both Firestore and RTDB)
     await _firebaseService.updateSlotStatus(
       stationId: station.id,
       slotIndex: slotIndex,
@@ -70,7 +72,7 @@ class StationProvider with ChangeNotifier {
     _stations = updatedStations;
     notifyListeners();
     
-    // Actual DB call
+    // Actual DB call (now updates both Firestore and RTDB)
     await _firebaseService.applyPreset(updatedStations);
   }
-}   
+}
