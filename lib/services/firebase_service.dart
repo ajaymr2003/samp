@@ -1,4 +1,4 @@
-// lib/services/firebase_service.dart ---
+//lib/services/firebase_service.dart ---
 
 import 'dart:convert';
 import 'package:flutter/services.dart' show rootBundle;
@@ -15,14 +15,10 @@ class FirebaseService {
   final FirebaseDatabase _database = FirebaseDatabase.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
-  // --- NEW: Path for RTDB station status data ---
   final String _rtdbStationStatusPath = 'station_status';
-
-  // --- V1 API CONFIGURATION ---
   final String _serviceAccountJsonPath = 'credentials/serviceAccountKey.json';
   final String _projectId = 'miniproject-c03ff';
 
-  // --- Method to get an OAuth 2.0 Access Token ---
   Future<String?> _getAccessToken() async {
     try {
       final jsonString = await rootBundle.loadString(_serviceAccountJsonPath);
@@ -37,8 +33,6 @@ class FirebaseService {
       return null;
     }
   }
-
-  // --- GENERAL METHODS ---
 
   String _encodeEmail(String email) {
     return email.replaceAll('.', ',');
@@ -55,7 +49,6 @@ class FirebaseService {
     }
   }
   
-  // --- VEHICLE METHODS ---
   Stream<Vehicle> getVehicleStream({required String email}) {
     final encodedEmail = _encodeEmail(email);
     final vehicleRef = _database.ref('vehicles/$encodedEmail');
@@ -80,9 +73,6 @@ class FirebaseService {
     }
   }
 
-  // --- STATION DATA METHODS ---
-
-  // Fetches static station data from Firestore (Source of Truth)
   Future<List<Station>> getStations() async {
     try {
       final snapshot = await _firestore.collection('stations').orderBy('name').get();
@@ -94,7 +84,6 @@ class FirebaseService {
     }
   }
 
-  // NEW: Gets a single station's name from Firestore (for notifications)
   Future<String> getStationName(String stationId) async {
     try {
       final doc = await _firestore.collection('stations').doc(stationId).get();
@@ -107,7 +96,6 @@ class FirebaseService {
     return 'Unknown Station';
   }
 
-  // NEW: Initializes/Syncs the RTDB structure from Firestore data
   Future<void> initializeStationStatusInRTDB(List<Station> stations) async {
     if (stations.isEmpty) return;
     try {
@@ -123,61 +111,92 @@ class FirebaseService {
     }
   }
 
-  // NEW: RTDB Stream for Vehicle Provider to get real-time slot status
   Stream<List<bool>?> getStationStatusStreamRTDB(String stationId) {
     return _database.ref('$_rtdbStationStatusPath/$stationId').onValue.map((event) {
       if (event.snapshot.exists && event.snapshot.value != null) {
         final data = List<dynamic>.from(event.snapshot.value as List);
         return data.map((e) => e as bool).toList();
       }
-      return null; // Station might not exist in RTDB yet
+      return null;
     });
   }
   
-  // MODIFIED: Now updates both Firestore and RTDB for consistency
   Future<void> updateSlotStatus({
     required String stationId,
     required int slotIndex,
     required bool isAvailable,
   }) async {
     final stationRef = _firestore.collection('stations').doc(stationId);
-    final doc = await stationRef.get();
-    if (doc.exists) {
-      List<dynamic> slots = doc.data()?['slots'] ?? [];
-      if (slotIndex < slots.length) {
-        slots[slotIndex]['isAvailable'] = isAvailable;
-        // Update Firestore (source of truth)
-        await stationRef.update({'slots': slots});
-        // Update RTDB (for fast real-time listeners)
-        await _database.ref('$_rtdbStationStatusPath/$stationId/$slotIndex').set(isAvailable);
+    try {
+      final doc = await stationRef.get();
+      if (doc.exists) {
+        List<dynamic> slots = doc.data()?['slots'] ?? [];
+        if (slotIndex < slots.length) {
+          slots[slotIndex]['isAvailable'] = isAvailable;
+          await stationRef.update({'slots': slots});
+          await _database.ref('$_rtdbStationStatusPath/$stationId/$slotIndex').set(isAvailable);
+        }
       }
+    } catch (e) {
+      print("Error updating slot status: $e");
     }
   }
 
-  // MODIFIED: Now updates both Firestore and RTDB for consistency
+  // --- NEW: Transactional method to find and occupy a slot safely ---
+  Future<int?> findAndOccupySlot(String stationId) async {
+    final stationRef = _firestore.collection('stations').doc(stationId);
+    int? foundSlotIndex;
+
+    try {
+      await _firestore.runTransaction((transaction) async {
+        final snapshot = await transaction.get(stationRef);
+        if (!snapshot.exists) {
+          throw Exception("Station document does not exist!");
+        }
+        
+        final station = Station.fromJson(snapshot.data()!..['id'] = snapshot.id);
+        final availableSlotIndex = station.slots.indexWhere((slot) => slot.isAvailable);
+
+        if (availableSlotIndex != -1) {
+          foundSlotIndex = availableSlotIndex;
+          List<Map<String, dynamic>> updatedSlots = station.slots.map((s) => s.toJson()).toList();
+          updatedSlots[availableSlotIndex]['isAvailable'] = false;
+          
+          transaction.update(stationRef, {'slots': updatedSlots});
+        }
+      });
+
+      if (foundSlotIndex != null) {
+        // Also update RTDB for real-time listeners
+        await _database.ref('$_rtdbStationStatusPath/$stationId/$foundSlotIndex').set(false);
+        print("Successfully occupied slot $foundSlotIndex at station $stationId");
+      }
+      return foundSlotIndex;
+    } catch (e) {
+      print("Error during findAndOccupySlot transaction: $e");
+      return null;
+    }
+  }
+
   Future<void> applyPreset(List<Station> updatedStations) async {
     final firestoreBatch = _firestore.batch();
     final Map<String, dynamic> rtdbUpdates = {};
 
     for (var station in updatedStations) {
-      // Prepare Firestore update
       final stationRef = _firestore.collection('stations').doc(station.id);
       final updatedSlotsJson = station.slots.map((s) => s.toJson()).toList();
       firestoreBatch.update(stationRef, {'slots': updatedSlotsJson});
       
-      // Prepare RTDB update
       final slotStatusList = station.slots.map((s) => s.isAvailable).toList();
       rtdbUpdates['$_rtdbStationStatusPath/${station.id}'] = slotStatusList;
     }
 
-    // Commit both updates atomically
     await Future.wait([
       firestoreBatch.commit(),
       _database.ref().update(rtdbUpdates)
     ]);
   }
 
-  // --- NAVIGATION METHODS ---
   Stream<NavigationRequest?> getNavigationStream({required String email}) {
     return _firestore.collection('navigation').doc(email).snapshots().map((doc) {
       if (doc.exists) {
@@ -187,19 +206,35 @@ class FirebaseService {
     });
   }
 
-  // --- MODIFIED: This method now correctly resets all cancellation-related fields ---
   Future<void> endNavigation({required String email}) async {
     try {
       final navRef = _firestore.collection('navigation').doc(email);
       await navRef.update({
         'isNavigating': false,
         'vehicleReachedStation': false,
-        'cancellationReason': FieldValue.delete(), // Clears the field
-        'cancelledStationName': FieldValue.delete(), // Clears the field
-        'stationIsFull': FieldValue.delete(), // Clears the field
+        'cancellationReason': FieldValue.delete(),
+        'cancelledStationName': FieldValue.delete(),
+        'stationIsFull': FieldValue.delete(),
       });
     } catch (e) {
       print("Could not end navigation (might not exist): $e");
+    }
+  }
+
+  // --- NEW: Method to call when vehicle arrives at a station ---
+  Future<void> setVehicleReachedStation({required String email}) async {
+    try {
+      final navRef = _firestore.collection('navigation').doc(email);
+      await navRef.update({
+        'isNavigating': false,
+        'vehicleReachedStation': true, // The key change
+        'cancellationReason': FieldValue.delete(),
+        'cancelledStationName': FieldValue.delete(),
+        'stationIsFull': FieldValue.delete(),
+      });
+      print("Updated navigation doc for $email: Vehicle has reached the station.");
+    } catch (e) {
+      print("Could not update navigation for vehicle arrival: $e");
     }
   }
   
@@ -214,7 +249,7 @@ class FirebaseService {
         'vehicleReachedStation': false,
         'cancellationReason': 'STATION_FULL',
         'cancelledStationName': stationName,
-        'stationIsFull': true, // Sets the field
+        'stationIsFull': true,
       });
       print("Navigation document for $email updated: cancelled because station '$stationName' is full.");
     } catch (e) {
@@ -222,7 +257,6 @@ class FirebaseService {
     }
   }
 
-  // --- USER SETTINGS & NOTIFICATION METHODS ---
   Future<UserModel?> getUserSettings(String email) async {
     try {
       final doc = await _firestore.collection('users').doc(email).get();
@@ -235,60 +269,25 @@ class FirebaseService {
     return null;
   }
 
-  Future<void> sendStationFullNotification({
-    required String fcmToken,
-    required String stationName,
-  }) async {
-    if (fcmToken.isEmpty) {
-      print("FCM token is empty. Cannot send notification.");
-      return;
-    }
+  Future<void> sendStationFullNotification({ required String fcmToken, required String stationName }) async {
+    if (fcmToken.isEmpty) return;
     final accessToken = await _getAccessToken();
     if (accessToken == null) return;
-
     final String url = 'https://fcm.googleapis.com/v1/projects/$_projectId/messages:send';
-    final Map<String, dynamic> message = {
-      'message': {
-        'token': fcmToken,
-        'notification': {
-          'title': 'Destination Full!',
-          'body': 'Your destination station "$stationName" has no available slots. Your trip has been cancelled.',
-        },
-        'data': { 'type': 'STATION_FULL', 'stationName': stationName }
-      }
-    };
+    final Map<String, dynamic> message = { 'message': { 'token': fcmToken, 'notification': { 'title': 'Destination Full!', 'body': 'Your destination station "$stationName" has no available slots. Your trip has been cancelled.', }, 'data': { 'type': 'STATION_FULL', 'stationName': stationName } } };
     try {
-      final response = await http.post(Uri.parse(url), headers: <String, String>{ 'Content-Type': 'application/json', 'Authorization': 'Bearer $accessToken' }, body: jsonEncode(message));
-      if (response.statusCode == 200) { print("Successfully sent station full notification via V1 API."); } 
-      else { print("Failed to send V1 notification: ${response.statusCode} - ${response.body}"); }
+      await http.post(Uri.parse(url), headers: <String, String>{ 'Content-Type': 'application/json', 'Authorization': 'Bearer $accessToken' }, body: jsonEncode(message));
     } catch (e) { print("Error sending V1 FCM notification: $e"); }
   }
 
-  Future<void> sendLowBatteryNotification({
-    required String fcmToken,
-    required double batteryLevel,
-  }) async {
-    if (fcmToken.isEmpty) {
-      print("FCM token is empty. Cannot send notification.");
-      return;
-    }
+  Future<void> sendLowBatteryNotification({ required String fcmToken, required double batteryLevel }) async {
+    if (fcmToken.isEmpty) return;
     final accessToken = await _getAccessToken();
     if (accessToken == null) return;
-    
     final String url = 'https://fcm.googleapis.com/v1/projects/$_projectId/messages:send';
-    final Map<String, dynamic> message = {
-      'message': {
-        'token': fcmToken,
-        'notification': {
-          'title': 'Low Battery Alert!',
-          'body': 'Your EV battery is at ${batteryLevel.toStringAsFixed(0)}%. Find a charging station soon.',
-        },
-      }
-    };
+    final Map<String, dynamic> message = { 'message': { 'token': fcmToken, 'notification': { 'title': 'Low Battery Alert!', 'body': 'Your EV battery is at ${batteryLevel.toStringAsFixed(0)}%. Find a charging station soon.', } } };
     try {
-      final response = await http.post(Uri.parse(url), headers: <String, String>{'Content-Type': 'application/json', 'Authorization': 'Bearer $accessToken'}, body: jsonEncode(message));
-      if (response.statusCode == 200) { print("Successfully sent low battery notification via V1 API."); } 
-      else { print("Failed to send V1 notification: ${response.statusCode} - ${response.body}"); }
+      await http.post(Uri.parse(url), headers: <String, String>{'Content-Type': 'application/json', 'Authorization': 'Bearer $accessToken'}, body: jsonEncode(message));
     } catch (e) { print("Error sending V1 FCM notification: $e"); }
   }
 }
