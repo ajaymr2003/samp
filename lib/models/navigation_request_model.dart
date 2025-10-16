@@ -8,18 +8,22 @@ class NavigationRequest {
   final LatLng end;
   final bool isNavigating;
   final String? destinationStationId;
-  final bool stationIsFull; // --- MODIFIED: New field ---
-  final String? cancellationReason; // --- MODIFIED: New field ---
-  final String? cancelledStationName; // --- MODIFIED: New field ---
+  final bool stationIsFull; 
+  final String? cancellationReason; 
+  final String? cancelledStationName; 
+  final bool isCharging; // --- NEW ---
+  final bool chargingComplete; // --- NEW ---
 
   NavigationRequest({
     required this.start,
     required this.end,
     required this.isNavigating,
     this.destinationStationId,
-    this.stationIsFull = false, // --- MODIFIED: Added to constructor ---
-    this.cancellationReason, // --- MODIFIED: Added to constructor ---
-    this.cancelledStationName, // --- MODIFIED: Added to constructor ---
+    this.stationIsFull = false, 
+    this.cancellationReason, 
+    this.cancelledStationName, 
+    this.isCharging = false, // --- NEW ---
+    this.chargingComplete = false, // --- NEW ---
   });
 
   factory NavigationRequest.fromFirestore(DocumentSnapshot doc) {
@@ -35,9 +39,11 @@ class NavigationRequest {
       ),
       isNavigating: data['isNavigating'] ?? false,
       destinationStationId: data['destinationStationId'],
-      stationIsFull: data['stationIsFull'] ?? false, // --- MODIFIED: Parse from Firestore ---
-      cancellationReason: data['cancellationReason'], // --- MODIFIED: Parse from Firestore ---
-      cancelledStationName: data['cancelledStationName'], // --- MODIFIED: Parse from Firestore ---
+      stationIsFull: data['stationIsFull'] ?? false, 
+      cancellationReason: data['cancellationReason'], 
+      cancelledStationName: data['cancelledStationName'], 
+      isCharging: data['isCharging'] ?? false, // --- NEW ---
+      chargingComplete: data['chargingComplete'] ?? false, // --- NEW ---
     );
   }
 }

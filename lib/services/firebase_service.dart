@@ -38,11 +38,21 @@ class FirebaseService {
     return email.replaceAll('.', ',');
   }
   
+  // --- MODIFIED: This method is now safe against missing email fields ---
   Future<List<String>> getUsers() async {
     try {
       final snapshot = await _firestore.collection('users').get();
       if (snapshot.docs.isEmpty) return ['default_simulator_user'];
-      return snapshot.docs.map((doc) => doc.data()['email'] as String).toList();
+
+      // Filter out documents that don't have a valid, non-null 'email' field.
+      final validDocs = snapshot.docs.where((doc) {
+        final data = doc.data();
+        return data.containsKey('email') && data['email'] != null;
+      });
+
+      // Now, map only the valid documents to a list of strings.
+      return validDocs.map((doc) => doc.data()['email'] as String).toList();
+      
     } catch (e) {
       print("Error fetching users: $e");
       return ['default_simulator_user'];
@@ -142,7 +152,6 @@ class FirebaseService {
     }
   }
 
-  // --- NEW: Transactional method to find and occupy a slot safely ---
   Future<int?> findAndOccupySlot(String stationId) async {
     final stationRef = _firestore.collection('stations').doc(stationId);
     int? foundSlotIndex;
@@ -167,7 +176,6 @@ class FirebaseService {
       });
 
       if (foundSlotIndex != null) {
-        // Also update RTDB for real-time listeners
         await _database.ref('$_rtdbStationStatusPath/$stationId/$foundSlotIndex').set(false);
         print("Successfully occupied slot $foundSlotIndex at station $stationId");
       }
@@ -212,32 +220,70 @@ class FirebaseService {
       await navRef.update({
         'isNavigating': false,
         'vehicleReachedStation': false,
-        'cancellationReason': FieldValue.delete(),
-        'cancelledStationName': FieldValue.delete(),
-        'stationIsFull': FieldValue.delete(),
+        'cancellationReason': null,
+        'cancelledStationName': null,
+        'stationIsFull': false,
       });
     } catch (e) {
       print("Could not end navigation (might not exist): $e");
     }
   }
 
-  // --- NEW: Method to call when vehicle arrives at a station ---
   Future<void> setVehicleReachedStation({required String email}) async {
     try {
       final navRef = _firestore.collection('navigation').doc(email);
       await navRef.update({
         'isNavigating': false,
-        'vehicleReachedStation': true, // The key change
-        'cancellationReason': FieldValue.delete(),
-        'cancelledStationName': FieldValue.delete(),
-        'stationIsFull': FieldValue.delete(),
+        'vehicleReachedStation': true,
+        'cancellationReason': null,
+        'cancelledStationName': null,
+        'stationIsFull': false,
       });
       print("Updated navigation doc for $email: Vehicle has reached the station.");
     } catch (e) {
       print("Could not update navigation for vehicle arrival: $e");
     }
   }
+
+  Future<void> setVehicleIsCharging({required String email}) async {
+    try {
+      final navRef = _firestore.collection('navigation').doc(email);
+      await navRef.update({
+        'isCharging': true,
+        'chargingComplete': false,
+      });
+      print("Updated navigation doc for $email: Vehicle is now charging.");
+    } catch (e) {
+      print("Could not update navigation for vehicle charging start: $e");
+    }
+  }
+
+  Future<void> setNavigationChargingComplete({required String email}) async {
+    try {
+      final navRef = _firestore.collection('navigation').doc(email);
+      await navRef.update({
+        'isCharging': false,
+        'chargingComplete': true,
+      });
+      print("Updated navigation doc for $email: Vehicle charging is complete.");
+    } catch (e) {
+      print("Could not update navigation for vehicle charging complete: $e");
+    }
+  }
   
+  Future<void> setNavigationChargingCancelled({required String email}) async {
+    try {
+      final navRef = _firestore.collection('navigation').doc(email);
+      await navRef.update({
+        'isCharging': false,
+        'chargingComplete': false,
+      });
+      print("Updated navigation doc for $email: Vehicle charging was cancelled.");
+    } catch (e) {
+      print("Could not update navigation for vehicle charging cancellation: $e");
+    }
+  }
+
   Future<void> cancelNavigationForFullStation({
     required String email,
     required String stationName,

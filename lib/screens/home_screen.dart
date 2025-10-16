@@ -78,6 +78,10 @@ class _HomeScreenState extends State<HomeScreen> {
     if (vehicleProvider.isSimulating || vehicleProvider.isPaused) {
        vehicleProvider.stopAndEndTrip(_selectedUserEmail!);
     }
+    // --- NEW: Also cancel charging if a new user is selected ---
+    if (vehicleProvider.isCharging) {
+      vehicleProvider.cancelCharging(_selectedUserEmail!);
+    }
     _resetState(clearUser: false);
     setState(() { _selectedUserEmail = email; });
     vehicleProvider.initialize(email);
@@ -92,7 +96,6 @@ class _HomeScreenState extends State<HomeScreen> {
         _mapController.move(vehicleLocation, 14.0);
         _batteryController.text = vehicle.batteryLevel.toStringAsFixed(0);
         
-        // --- MODIFIED: Update instruction based on vehicle state ---
         if (!vehicle.isCharging && !vehicle.isRunning && !vehicle.isPaused) {
            setState(() {
             _mapInstruction = "Vehicle ready. Click map to set a Destination.";
@@ -105,53 +108,71 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _listenForRemoteNavigation(String email) {
     _navigationSubscription?.cancel();
+    
     _navigationSubscription = _firebaseService.getNavigationStream(email: email).listen((navRequest) {
       if (navRequest != null && navRequest.isNavigating && !_isProcessingRemoteNav) {
+        print("✅ Remote command received: isNavigating is true. Starting trip.");
         _startRemoteNavigation(navRequest);
       } 
-      else if (navRequest == null || !navRequest.isNavigating) {
-         if (_isProcessingRemoteNav) {
-          setState(() {
-            _isProcessingRemoteNav = false;
-            _destinationPoint = null;
-            _routePoints = [];
-            _mapInstruction = "Remote trip ended. Set a new destination.";
-          });
+      else if ((navRequest == null || !navRequest.isNavigating) && _isProcessingRemoteNav) {
+        print("⏹️ Remote command received: isNavigating is false. Cleaning up.");
+        final vehicleProvider = Provider.of<VehicleProvider>(context, listen: false);
+        if (vehicleProvider.isSimulating || vehicleProvider.isPaused) {
+          vehicleProvider.forceStopForOverride(email);
         }
+        _stopRemoteNavigationCleanup();
       }
     });
+  }
+  
+  void _stopRemoteNavigationCleanup() {
+      setState(() {
+        _isProcessingRemoteNav = false; 
+        _destinationPoint = null;
+        _routePoints = [];
+        _mapInstruction = "Remote trip ended. Set a new destination.";
+      });
   }
 
   Future<void> _startRemoteNavigation(NavigationRequest navRequest) async {
     final vehicleProvider = Provider.of<VehicleProvider>(context, listen: false);
 
+    print("🛑 Overriding any current simulator activity...");
+    if (vehicleProvider.isSimulating || vehicleProvider.isPaused) {
+      vehicleProvider.forceStopForOverride(_selectedUserEmail!);
+    }
+    if (vehicleProvider.isCharging) {
+      // --- MODIFIED: Use cancelCharging for overrides ---
+      await vehicleProvider.cancelCharging(_selectedUserEmail!);
+    }
+
     setState(() {
-      _isProcessingRemoteNav = true;
-      if (vehicleProvider.isSimulating || vehicleProvider.isPaused) {
-        vehicleProvider.forceStopForOverride(_selectedUserEmail!);
-      }
+      _isProcessingRemoteNav = true; 
+      _isEditingLocation = false; 
       _mapInstruction = "REMOTE COMMAND: Calculating route...";
       _destinationPoint = navRequest.end;
       _routePoints = [];
     });
 
-    final newRoute = await _calculateAndDrawRoute(navRequest.start);
+    final liveStartPoint = LatLng(vehicleProvider.vehicle.latitude, vehicleProvider.vehicle.longitude);
+    final liveBattery = vehicleProvider.vehicle.batteryLevel;
+    print("▶️ Starting remote navigation from live location: $liveStartPoint");
+
+    final newRoute = await _calculateAndDrawRoute(liveStartPoint);
     if (newRoute != null) {
       vehicleProvider.startSimulation(
         route: newRoute,
         userEmail: _selectedUserEmail!,
-        initialBattery: vehicleProvider.vehicle.batteryLevel,
+        initialBattery: liveBattery,
         initialSpeedKmh: _vehicleSpeedKmh,
         initialDrainRate: _drainRatePerMinute,
         destinationStationId: navRequest.destinationStationId,
       );
       setState(() { _mapInstruction = "AUTOMATIC TRIP IN PROGRESS..."; });
     } else {
+      print("❌ Failed to calculate remote route. Cleaning up.");
       await _firebaseService.endNavigation(email: _selectedUserEmail!);
-      setState(() { 
-        _mapInstruction = "Failed to calculate remote route.";
-        _isProcessingRemoteNav = false;
-      });
+      _stopRemoteNavigationCleanup(); 
     }
   }
 
@@ -166,7 +187,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _vehicleSpeedKmh = 60.0;
       _drainRatePerMinute = 1.0;
       _isEditingLocation = false;
-      _isProcessingRemoteNav = false;
+      _isProcessingRemoteNav = false; 
       _mapInstruction = "Select a user to begin.";
     });
   }
@@ -187,8 +208,15 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _destinationPoint = latlng;
       _routePoints = [];
-      _mapInstruction = "Destination set. Press Start to begin trip.";
+      _mapInstruction = "Calculating route...";
     });
+
+    final newRoute = await _calculateAndDrawRoute();
+    if (mounted && newRoute != null) {
+      setState(() {
+        _mapInstruction = "Destination set. Press Start to begin trip.";
+      });
+    }
   }
   
   Future<List<LatLng>?> _calculateAndDrawRoute([LatLng? startPointOverride]) async {
@@ -197,15 +225,7 @@ class _HomeScreenState extends State<HomeScreen> {
     
     if (_destinationPoint == null) return null;
     final apiService = Provider.of<ApiService>(context, listen: false);
-    final stationProvider = Provider.of<StationProvider>(context, listen: false);
     
-    // Find if the destination is a station
-    final station = stationProvider.stations.firstWhere(
-      (s) => LatLng(s.latitude, s.longitude) == _destinationPoint,
-      orElse: () => Station.fromJson({}), // Return an empty station if not found
-    );
-    final destinationStationId = station.id.isNotEmpty ? station.id : null;
-
     try {
       final points = await apiService.getRoute(startPoint, _destinationPoint!);
       if (points.isNotEmpty && mounted) {
@@ -228,7 +248,6 @@ class _HomeScreenState extends State<HomeScreen> {
     final vehicleProvider = Provider.of<VehicleProvider>(context);
     final stationProvider = Provider.of<StationProvider>(context);
 
-    // --- MODIFIED: Don't update text field while charging/driving ---
     if (!vehicleProvider.isSimulating && !vehicleProvider.isPaused && !vehicleProvider.isCharging && _selectedUserEmail != null) {
       final providerValue = vehicleProvider.vehicle.batteryLevel.toStringAsFixed(0);
       if (_batteryController.text != providerValue) {
@@ -279,7 +298,6 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // --- MODIFIED: Added StationProvider ---
   Widget _buildControlPanel(VehicleProvider vehicleProvider, StationProvider stationProvider) {
     final isSimulating = vehicleProvider.isSimulating;
     final isPaused = vehicleProvider.isPaused;
@@ -287,17 +305,49 @@ class _HomeScreenState extends State<HomeScreen> {
     final arrivedAtStation = vehicleProvider.arrivedAtStationId != null;
     final canStart = _destinationPoint != null && !isSimulating && !isPaused && _selectedUserEmail != null && !isCharging;
     final bool isBatteryFull = vehicleProvider.vehicle.batteryLevel >= 100;
+    final bool isUtilityDisabled = isSimulating || isPaused || isCharging || _selectedUserEmail == null || _isProcessingRemoteNav;
 
     Widget actionButton;
     Widget secondaryButton;
     
-    // --- NEW: Charging UI Logic ---
+    // --- MODIFIED: UI logic for charging now has two distinct buttons ---
     if (isCharging) {
-      actionButton = _buildActionButton(icon: Icons.stop_circle_outlined, text: 'Stop Charging', color: Colors.red.shade600,
-        onPressed: () { 
-          vehicleProvider.stopCharging(_selectedUserEmail!); 
-          setState(() => _mapInstruction = "Charging stopped. Set a new destination.");
-        }
+      actionButton = Row(
+        children: [
+          Expanded(
+            flex: 2,
+            child: ElevatedButton.icon(
+              icon: const Icon(Icons.check_circle_outline_rounded, size: 20),
+              label: const Text('Finish'),
+              style: ElevatedButton.styleFrom(
+                foregroundColor: Colors.white,
+                backgroundColor: Colors.green.shade600,
+                padding: const EdgeInsets.symmetric(vertical: 12),
+              ),
+              onPressed: () {
+                vehicleProvider.finishCharging(_selectedUserEmail!);
+                setState(() => _mapInstruction = "Charging complete. Set a new destination.");
+              },
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            flex: 2,
+            child: OutlinedButton.icon(
+              icon: const Icon(Icons.cancel_outlined, size: 20),
+              label: const Text('Cancel'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.red.shade700,
+                side: BorderSide(color: Colors.red.shade700),
+                padding: const EdgeInsets.symmetric(vertical: 12),
+              ),
+              onPressed: () {
+                vehicleProvider.cancelCharging(_selectedUserEmail!);
+                setState(() => _mapInstruction = "Charging cancelled. Set a new destination.");
+              },
+            ),
+          )
+        ],
       );
     } else if (arrivedAtStation && !isSimulating && !isPaused) {
        actionButton = _buildActionButton(icon: Icons.ev_station_rounded, text: 'Start Charging', color: Colors.blue.shade700,
@@ -307,7 +357,6 @@ class _HomeScreenState extends State<HomeScreen> {
          }
       );
     } 
-    // --- Existing Driving UI Logic ---
     else if (isSimulating) {
       actionButton = _buildActionButton(icon: Icons.pause_rounded, text: 'Pause', color: Colors.amber.shade700,
         onPressed: () { vehicleProvider.pauseSimulation(_selectedUserEmail!); }
@@ -319,23 +368,27 @@ class _HomeScreenState extends State<HomeScreen> {
     } else {
        actionButton = _buildActionButton(
         icon: Icons.play_arrow_rounded, text: 'Start', color: Colors.green.shade600,
-        onPressed: !canStart || _isProcessingRemoteNav ? null : () async {
-          setState(() { _mapInstruction = "Calculating route..."; });
+        onPressed: !canStart || _isProcessingRemoteNav ? null : () {
            final station = stationProvider.stations.firstWhere(
             (s) => LatLng(s.latitude, s.longitude) == _destinationPoint,
             orElse: () => Station.fromJson({}),
           );
           final destinationStationId = station.id.isNotEmpty ? station.id : null;
 
-          final newRoute = await _calculateAndDrawRoute();
-          if (newRoute != null) {
+          if (_routePoints.isNotEmpty) {
             vehicleProvider.startSimulation(
-              route: newRoute, userEmail: _selectedUserEmail!,
+              route: _routePoints,
+              userEmail: _selectedUserEmail!,
               initialBattery: vehicleProvider.vehicle.batteryLevel,
-              initialSpeedKmh: _vehicleSpeedKmh, initialDrainRate: _drainRatePerMinute,
+              initialSpeedKmh: _vehicleSpeedKmh, 
+              initialDrainRate: _drainRatePerMinute,
               destinationStationId: destinationStationId,
             );
             setState(() { _mapInstruction = "Simulation in progress..."; });
+          } else {
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text('Route not available. Please select destination again.')
+            ));
           }
         }
       );
@@ -418,21 +471,46 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(height: 12),
                 Row(children: [ 
                   Expanded(child: actionButton), 
-                  // --- HIDE END TRIP BUTTON DURING CHARGING ---
                   if (!isCharging && !arrivedAtStation) ...[
                     const SizedBox(width: 10), 
                     Expanded(child: secondaryButton)
                   ] 
                 ]),
                 const SizedBox(height: 8),
-                TextButton.icon(
-                  icon: const Icon(Icons.refresh_rounded, size: 20), label: const Text('Reset Vehicle (100% Bat)'),
-                  style: TextButton.styleFrom(foregroundColor: Colors.grey.shade700),
-                  onPressed: isSimulating || isPaused || isCharging || _selectedUserEmail == null || _isProcessingRemoteNav ? null : () {
-                    vehicleProvider.resetSimulation(_selectedUserEmail!);
-                    setState(() { _routePoints = []; _destinationPoint = null; _mapInstruction = "Vehicle reset. Set a new destination."; });
-                  },
-                )
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    TextButton.icon(
+                      icon: Icon(_isEditingLocation ? Icons.cancel : Icons.edit_location_alt_rounded, size: 20),
+                      label: Text(_isEditingLocation ? 'Cancel' : 'Set Vehicle Location'),
+                      style: TextButton.styleFrom(
+                        foregroundColor: _isEditingLocation ? Colors.white : Theme.of(context).primaryColor,
+                        backgroundColor: _isEditingLocation ? Theme.of(context).primaryColor : Colors.transparent,
+                      ),
+                      onPressed: isUtilityDisabled && !_isEditingLocation ? null : () {
+                        setState(() {
+                          _isEditingLocation = !_isEditingLocation;
+                          if (_isEditingLocation) {
+                            _mapInstruction = "Click map to set vehicle's start location.";
+                            _destinationPoint = null;
+                            _routePoints = [];
+                          } else {
+                            _mapInstruction = "Location editing cancelled. Set a new destination.";
+                          }
+                        });
+                      },
+                    ),
+                    TextButton.icon(
+                      icon: const Icon(Icons.refresh_rounded, size: 20),
+                      label: const Text('Reset Vehicle'),
+                      style: TextButton.styleFrom(foregroundColor: Colors.grey.shade700),
+                      onPressed: isUtilityDisabled ? null : () {
+                        vehicleProvider.resetSimulation(_selectedUserEmail!);
+                        setState(() { _routePoints = []; _destinationPoint = null; _mapInstruction = "Vehicle reset. Set a new destination."; });
+                      },
+                    ),
+                  ],
+                ),
               ],
             ),
           ),
@@ -521,9 +599,11 @@ class _HomeScreenState extends State<HomeScreen> {
     markers.add(Marker(
       point: LatLng(vehicle.latitude, vehicle.longitude),
       width: 40, height: 40,
-      child: (vehicle.isRunning || vehicle.isPaused || vehicle.isCharging)
-          ? Image.asset('assets/car_icon.png')
-          : const Icon(Icons.location_on, color: Colors.green, size: 40),
+      child: _isEditingLocation 
+          ? const Icon(Icons.add_location_alt_outlined, color: Colors.blue, size: 40)
+          : (vehicle.isRunning || vehicle.isPaused || vehicle.isCharging)
+              ? Image.asset('assets/car_icon.png')
+              : const Icon(Icons.location_on, color: Colors.green, size: 40),
     ));
     
     return markers;

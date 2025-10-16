@@ -15,20 +15,20 @@ class VehicleProvider with ChangeNotifier {
 
   bool get isSimulating => _vehicle.isRunning;
   bool get isPaused => _vehicle.isPaused;
-  bool get isCharging => _vehicle.isCharging; // <-- NEW getter
-  String? get arrivedAtStationId => _arrivedAtStationId; // <-- NEW getter
+  bool get isCharging => _vehicle.isCharging; 
+  String? get arrivedAtStationId => _arrivedAtStationId; 
 
   // --- Simulation State ---
   Timer? _simulationTimer;
-  Timer? _chargingTimer; // <-- NEW
+  Timer? _chargingTimer; 
   List<latlong.LatLng> _route = [];
   DateTime? _startTime;
   DateTime? _pauseTime;
   DateTime? _lastTickTime;
   double _lastKnownBattery = 100.0;
-  String? _destinationStationId; // <-- Keep track of the destination
-  String? _arrivedAtStationId; // <-- NEW: To know where we can charge
-  int? _chargingSlotIndex; // <-- NEW: To know which slot to free up
+  String? _destinationStationId; 
+  String? _arrivedAtStationId; 
+  int? _chargingSlotIndex; 
   
   // --- State for notification logic ---
   UserModel? _userSettings;
@@ -57,10 +57,7 @@ class VehicleProvider with ChangeNotifier {
       _vehicle = vehicleData;
       _lastKnownBattery = vehicleData.batteryLevel;
       
-      if (!_vehicle.isRunning && (_simulationTimer?.isActive ?? false)) {
-        _stopSimulationTimer(clearRoute: false);
-      }
-      if (wasCharging && !_vehicle.isCharging) { // Remote stop charging
+      if (wasCharging && !_vehicle.isCharging) {
         _stopChargingTimer();
       }
       notifyListeners();
@@ -77,14 +74,15 @@ class VehicleProvider with ChangeNotifier {
 
   Future<void> manuallyUpdatePosition(String userEmail, latlong.LatLng newPosition) async {
     if (isSimulating || isPaused || isCharging) return;
-    final updatedVehicle = _vehicle.copyWith(latitude: newPosition.latitude, longitude: newPosition.longitude);
+    final updatedVehicle = _vehicle.copyWith(
+        latitude: newPosition.latitude, longitude: newPosition.longitude, speed: 0.0);
     await _firebaseService.updateVehicleState(email: userEmail, vehicle: updatedVehicle);
   }
 
   Future<void> manuallyUpdateBattery(String userEmail, double newBatteryLevel) async {
     if (isSimulating || isPaused || isCharging) return;
     final clampedLevel = newBatteryLevel.clamp(0.0, 100.0);
-    final updatedVehicle = _vehicle.copyWith(batteryLevel: clampedLevel);
+    final updatedVehicle = _vehicle.copyWith(batteryLevel: clampedLevel, speed: 0.0);
     await _firebaseService.updateVehicleState(email: userEmail, vehicle: updatedVehicle);
   }
 
@@ -96,11 +94,12 @@ class VehicleProvider with ChangeNotifier {
     required double initialDrainRate,
     String? destinationStationId, 
   }) {
-    if (isSimulating || route.isEmpty) return;
+    if (_simulationTimer?.isActive ?? false) return;
+    
     _notificationSent = false; 
     _stationFullNotificationSent = false; 
-    _arrivedAtStationId = null; // Clear previous arrival state
-    _destinationStationId = destinationStationId; // Store for arrival check
+    _arrivedAtStationId = null; 
+    _destinationStationId = destinationStationId; 
 
     _stationStatusSubscription?.cancel();
     if (destinationStationId != null) {
@@ -117,6 +116,7 @@ class VehicleProvider with ChangeNotifier {
     _lastTickTime = DateTime.now();
     _lastKnownBattery = initialBattery;
     
+    // Speed will be updated on the first tick, so no need to set it here.
     final startingVehicleState = _vehicle.copyWith(
       latitude: route.first.latitude, longitude: route.first.longitude,
       isRunning: true, isPaused: false, batteryLevel: initialBattery, isCharging: false,
@@ -129,7 +129,7 @@ class VehicleProvider with ChangeNotifier {
     if (!isSimulating) return;
     _simulationTimer?.cancel();
     _pauseTime = DateTime.now();
-    final pausedState = _vehicle.copyWith(isRunning: false, isPaused: true);
+    final pausedState = _vehicle.copyWith(isRunning: false, isPaused: true, speed: 0.0);
     _firebaseService.updateVehicleState(email: userEmail, vehicle: pausedState);
   }
 
@@ -139,6 +139,7 @@ class VehicleProvider with ChangeNotifier {
     _startTime = _startTime!.add(pausedDuration);
     _pauseTime = null;
     _lastTickTime = DateTime.now();
+    // Speed will be updated on the next tick.
     final resumedState = _vehicle.copyWith(isRunning: true, isPaused: false);
     _firebaseService.updateVehicleState(email: userEmail, vehicle: resumedState);
     _startTimer(userEmail);
@@ -149,13 +150,13 @@ class VehicleProvider with ChangeNotifier {
     _stationStatusSubscription?.cancel(); 
     _stationStatusSubscription = null;
     _stopSimulationTimer(clearRoute: true);
-    final stoppedVehicleState = _vehicle.copyWith(isRunning: false, isPaused: false, isCharging: false);
+    final stoppedVehicleState = _vehicle.copyWith(isRunning: false, isPaused: false, isCharging: false, speed: 0.0);
     _firebaseService.updateVehicleState(email: userEmail, vehicle: stoppedVehicleState);
   }
 
   void stopAndEndTrip(String userEmail) {
     forceStopForOverride(userEmail);
-    _arrivedAtStationId = null; // Ensure no charging button appears
+    _arrivedAtStationId = null; 
     _firebaseService.endNavigation(email: userEmail);
   }
   
@@ -167,18 +168,18 @@ class VehicleProvider with ChangeNotifier {
 
   Future<void> resetSimulation(String userEmail) async {
     stopAndEndTrip(userEmail);
-    final resetState = _vehicle.copyWith(batteryLevel: 100.0, isRunning: false, isPaused: false, isCharging: false);
+    final resetState = _vehicle.copyWith(batteryLevel: 100.0, isRunning: false, isPaused: false, isCharging: false, speed: 0.0);
     await _firebaseService.updateVehicleState(email: userEmail, vehicle: resetState);
   }
 
-  // --- NEW: Charging Logic ---
   Future<void> startCharging(String userEmail) async {
     if (isSimulating || isPaused || isCharging || _arrivedAtStationId == null) return;
     
     final slotIndex = await _firebaseService.findAndOccupySlot(_arrivedAtStationId!);
     if (slotIndex != null) {
       _chargingSlotIndex = slotIndex;
-      final chargingState = _vehicle.copyWith(isCharging: true);
+      await _firebaseService.setVehicleIsCharging(email: userEmail);
+      final chargingState = _vehicle.copyWith(isCharging: true, speed: 0.0);
       await _firebaseService.updateVehicleState(email: userEmail, vehicle: chargingState);
       
       _chargingTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
@@ -186,30 +187,28 @@ class VehicleProvider with ChangeNotifier {
       });
     } else {
       print("Could not start charging. No available slots found at $_arrivedAtStationId.");
-      // Optionally show a message to the user
-      _arrivedAtStationId = null; // Reset state so button disappears
+      _arrivedAtStationId = null; 
       notifyListeners();
     }
   }
 
   void _onChargeTick(String userEmail) {
     if (_vehicle.batteryLevel >= 100) {
-      stopCharging(userEmail);
+      finishCharging(userEmail);
       return;
     }
     
-    // Add ~1% every 2 seconds
     final newBatteryLevel = (_vehicle.batteryLevel + 1.0).clamp(0.0, 100.0);
+    // Only need to update battery, other states are static during charging.
     final updatedVehicle = _vehicle.copyWith(batteryLevel: newBatteryLevel);
     _firebaseService.updateVehicleState(email: userEmail, vehicle: updatedVehicle);
   }
 
-  Future<void> stopCharging(String userEmail) async {
+  Future<void> _endChargingProcess(String userEmail) async {
     if (!isCharging) return;
-    
+
     _stopChargingTimer();
 
-    // Free up the slot
     if (_arrivedAtStationId != null && _chargingSlotIndex != null) {
       await _firebaseService.updateSlotStatus(
         stationId: _arrivedAtStationId!,
@@ -218,12 +217,21 @@ class VehicleProvider with ChangeNotifier {
       );
     }
     
-    final stoppedChargingState = _vehicle.copyWith(isCharging: false);
+    final stoppedChargingState = _vehicle.copyWith(isCharging: false, speed: 0.0);
     await _firebaseService.updateVehicleState(email: userEmail, vehicle: stoppedChargingState);
     
-    // Reset state
     _arrivedAtStationId = null;
     _chargingSlotIndex = null;
+  }
+
+  Future<void> finishCharging(String userEmail) async {
+    await _endChargingProcess(userEmail);
+    await _firebaseService.setNavigationChargingComplete(email: userEmail);
+  }
+
+  Future<void> cancelCharging(String userEmail) async {
+    await _endChargingProcess(userEmail);
+    await _firebaseService.setNavigationChargingCancelled(email: userEmail);
   }
 
   void _onStationStatusChangedRTDB(List<bool>? availableSlots, String stationId) async {
@@ -272,8 +280,8 @@ class VehicleProvider with ChangeNotifier {
     
     if (currentPosition == null) {
       currentPosition = _route.last;
-      _completeTrip(userEmail, currentPosition); // <-- MODIFIED: Call trip completion logic
-      return; // Stop further processing for this tick
+      _completeTrip(userEmail, currentPosition); 
+      return; 
     }
     
     final deltaTime = now.difference(lastTick);
@@ -288,15 +296,16 @@ class VehicleProvider with ChangeNotifier {
       _firebaseService.sendLowBatteryNotification(fcmToken: _userSettings!.fcmToken, batteryLevel: _lastKnownBattery);
     }
     
+    // --- MODIFIED: Include the current speed in the update ---
     final updatedVehicle = _vehicle.copyWith(
       latitude: currentPosition.latitude,
       longitude: currentPosition.longitude,
       batteryLevel: _lastKnownBattery,
+      speed: _vehicleSpeedKmh, // <-- THE KEY CHANGE
     );
     _firebaseService.updateVehicleState(email: userEmail, vehicle: updatedVehicle);
   }
   
-  // --- NEW: Logic to handle trip completion ---
   void _completeTrip(String userEmail, latlong.LatLng finalPosition) {
     _stopSimulationTimer(clearRoute: true);
     
@@ -306,22 +315,21 @@ class VehicleProvider with ChangeNotifier {
       latitude: finalPosition.latitude,
       longitude: finalPosition.longitude,
       batteryLevel: _lastKnownBattery,
+      speed: 0.0, // <-- Set speed to 0 on arrival
     );
     _firebaseService.updateVehicleState(email: userEmail, vehicle: finalState);
 
     if (_destinationStationId != null) {
-      // Vehicle has arrived at a station
       _arrivedAtStationId = _destinationStationId;
       _firebaseService.setVehicleReachedStation(email: userEmail);
     } else {
-      // Trip ended at a random point
       _firebaseService.endNavigation(email: userEmail);
     }
     
-    _destinationStationId = null; // Clear for next trip
+    _destinationStationId = null; 
     _stationStatusSubscription?.cancel();
     _stationStatusSubscription = null;
-    notifyListeners(); // Notify UI that arrival state has changed
+    notifyListeners(); 
   }
   
   void _stopSimulationTimer({required bool clearRoute}) {
